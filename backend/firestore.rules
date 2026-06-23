@@ -1,0 +1,247 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ==========================================
+    // GLOBAL SECURITY HELPER FUNCTIONS
+    // ==========================================
+
+    // Checks if the visitor request is fully authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Resolves core parameters from standard Custom Claims/Tokens
+    function getRole() {
+      return request.auth.token.role;
+    }
+
+    function getUserCompanyGroupId() {
+      return request.auth.token.companyGroupId;
+    }
+
+    function getUserCompanyId() {
+      return request.auth.token.companyId;
+    }
+
+    // Fallback getter from Firestore if Custom Claims are unset
+    function getUserDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+
+    // Checks if the user is a global Super Administrator
+    function isSuperAdmin() {
+      return isAuthenticated() && (getRole() == 'super_admin' || getUserDoc().role == 'super_admin');
+    }
+
+    // Tenant boundary check: validates if the caller owns the targeted operational scope
+    function isWithinTenantGroupScope(companyGroupId) {
+      return isSuperAdmin() || (
+        isAuthenticated() && 
+        (getUserCompanyGroupId() == companyGroupId || getUserDoc().companyGroupId == companyGroupId)
+      );
+    }
+
+    function isWithinTenantCompanyScope(companyGroupId, companyId) {
+      return isSuperAdmin() || (
+        isWithinTenantGroupScope(companyGroupId) && 
+        (getUserCompanyId() == companyId || getUserDoc().companyId == companyId)
+      );
+    }
+
+    function isWithinTenantSiteScope(companyGroupId, companyId, siteId) {
+      return isSuperAdmin() || (
+        isWithinTenantCompanyScope(companyGroupId, companyId) && 
+        (getUserDoc().siteId == siteId || getUserDoc().siteId == "")
+      );
+    }
+
+    // Validates incoming resource structures for standardized immutable fields
+    function incomingMatchesTenantBounds() {
+      return request.resource.data.companyGroupId != null &&
+             request.resource.data.companyId != null &&
+             request.resource.data.siteId != null;
+    }
+
+    // Checks if target metadata remains immutable
+    function blockTenancyTransitions() {
+      return request.resource.data.companyGroupId == resource.data.companyGroupId &&
+             request.resource.data.companyId == resource.data.companyId &&
+             request.resource.data.siteId == resource.data.siteId;
+    }
+
+    // ==========================================
+    // 1. COMPANY GROUPS SYSTEM
+    // ==========================================
+    match /company_groups/{groupId} {
+      allow read: if isSuperAdmin() || isWithinTenantGroupScope(resource.data.id);
+      allow write: if false; // DIRECT CLIENT WRITE BLOCKED - Managed via Cloud Functions
+    }
+
+    // ==========================================
+    // 2. COMPANIES SYSTEM
+    // ==========================================
+    match /companies/{companyId} {
+      allow read: if isSuperAdmin() || isWithinTenantCompanyScope(resource.data.companyGroupId, resource.data.id);
+      allow write: if false; // DIRECT CLIENT WRITE BLOCKED - Managed via Cloud Functions
+    }
+
+    // ==========================================
+    // 3. SECURE SITES & CHECKPOINTS
+    // ==========================================
+    match /sites/{siteId} {
+      allow read: if isSuperAdmin() || isWithinTenantSiteScope(resource.data.companyGroupId, resource.data.companyId, resource.data.id);
+      allow write: if false; // DIRECT CLIENT WRITE BLOCKED - Managed via Cloud Functions
+    }
+
+    match /units/{unitId} {
+      allow read: if isSuperAdmin() || isWithinTenantSiteScope(resource.data.companyGroupId, resource.data.companyId, resource.data.siteId);
+      allow write: if false; // DIRECT CLIENT WRITE BLOCKED - Managed via Cloud Functions
+    }
+
+    // ==========================================
+    // 4. USER DIRECTORY & IAM BOUNDARIES
+    // ==========================================
+    match /users/{userId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        request.auth.uid == userId ||
+        isWithinTenantCompanyScope(resource.data.companyGroupId, resource.data.companyId)
+      );
+      allow create, update: if isAuthenticated() && (
+        isSuperAdmin() || 
+        (request.auth.uid == userId && incomingMatchesTenantBounds())
+      );
+      allow delete: if isSuperAdmin();
+    }
+
+    // ==========================================
+    // 5. ATTENDANCE & GEOGRAPHIC ROTA
+    // ==========================================
+    match /attendance/{attendanceId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        isWithinTenantCompanyScope(resource.data.companyGroupId, resource.data.companyId) ||
+        (getUserDoc().role == 'guard' && resource.data.userId == request.auth.uid)
+      );
+      // Punch Operations are strictly compiled and coordinated through geo-validated Cloud Functions
+      allow write: if false; 
+    }
+
+    // ==========================================
+    // 6. visitors & RESIDENT INVITATIONS
+    // ==========================================
+    match /visitors/{visitorId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        isWithinTenantSiteScope(resource.data.companyGroupId, resource.data.companyId, resource.data.siteId)
+      );
+      allow create: if isAuthenticated() && 
+                    incomingMatchesTenantBounds() && 
+                    isWithinTenantSiteScope(request.resource.data.companyGroupId, request.resource.data.companyId, request.resource.data.siteId);
+      allow update: if isAuthenticated() && 
+                    blockTenancyTransitions() && 
+                    isWithinTenantSiteScope(resource.data.companyGroupId, resource.data.companyId, resource.data.siteId);
+      allow delete: if isSuperAdmin();
+    }
+
+    // ==========================================
+    // 7. INCIDENT REPORTING LOGS
+    // ==========================================
+    match /incidents/{incidentId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        isWithinTenantSiteScope(resource.data.companyGroupId, resource.data.companyId, resource.data.siteId)
+      );
+      allow create: if isAuthenticated() && 
+                    incomingMatchesTenantBounds() && 
+                    isWithinTenantSiteScope(request.resource.data.companyGroupId, request.resource.data.companyId, request.resource.data.siteId);
+      allow update: if isAuthenticated() && 
+                    blockTenancyTransitions() && 
+                    isWithinTenantSiteScope(resource.data.companyGroupId, resource.data.companyId, resource.data.siteId);
+      allow delete: if isSuperAdmin();
+    }
+
+    // ==========================================
+    // 8. ENTERPRISE FINANCIAL SYSTEMS (STRICT WRITE REJECTION)
+    // ==========================================
+    match /payroll/{payrollId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        isWithinTenantCompanyScope(resource.data.companyGroupId, resource.data.companyId)
+      );
+      allow write: if false; // DIRECT CLIENT WRITE BLOCKED - Cloud Functions only
+    }
+
+    match /billing/{billingId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        isWithinTenantCompanyScope(resource.data.companyGroupId, resource.data.companyId)
+      );
+      allow write: if false; // DIRECT CLIENT WRITE BLOCKED - Cloud Functions only
+    }
+
+    match /contracts/{contractId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        isWithinTenantCompanyScope(resource.data.companyGroupId, resource.data.companyId)
+      );
+      allow write: if false; // DIRECT CLIENT WRITE BLOCKED - Cloud Functions only
+    }
+
+    // ==========================================
+    // 9. IMMUTABLE SYSTEM COMPLIANCE AUDIT
+    // ==========================================
+    match /audit_logs/{logId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        isWithinTenantCompanyScope(resource.data.companyGroupId, resource.data.companyId)
+      );
+      allow write: if false; // IMMUTABLE LOGS - DIRECT CLIENT WRITES strictly blocked forever
+    }
+
+    // ==========================================
+    // 10. LEAVE REQUESTS
+    // ==========================================
+    match /leave_requests/{requestId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        resource.data.userId == request.auth.uid ||
+        isWithinTenantCompanyScope(resource.data.companyGroupId, resource.data.companyId)
+      );
+      allow create: if isAuthenticated() && 
+                    incomingMatchesTenantBounds() && 
+                    isWithinTenantCompanyScope(request.resource.data.companyGroupId, request.resource.data.companyId);
+      allow update: if isAuthenticated() && 
+                    blockTenancyTransitions() && 
+                    isWithinTenantCompanyScope(resource.data.companyGroupId, resource.data.companyId);
+      allow delete: if isSuperAdmin();
+    }
+
+    // ==========================================
+    // 11. PHYSICAL ASSETS
+    // ==========================================
+    match /assets/{assetId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        isWithinTenantSiteScope(resource.data.companyGroupId, resource.data.companyId, resource.data.siteId)
+      );
+      allow create, update: if isAuthenticated() && 
+                            incomingMatchesTenantBounds() && 
+                            isWithinTenantSiteScope(request.resource.data.companyGroupId, request.resource.data.companyId, request.resource.data.siteId);
+      allow delete: if isSuperAdmin();
+    }
+
+    // ==========================================
+    // 12. REAL-TIME NOTIFICATIONS
+    // ==========================================
+    match /notifications/{notifyId} {
+      allow read: if isAuthenticated() && (
+        isSuperAdmin() || 
+        resource.data.recipientId == request.auth.uid ||
+        isWithinTenantSiteScope(resource.data.companyGroupId, resource.data.companyId, resource.data.siteId)
+      );
+      allow write: if false; // Handled exclusively via Cloud Functions trigger mechanisms
+    }
+  }
+}

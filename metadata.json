@@ -1,0 +1,6 @@
+{
+  "name": "Kundal OS V3",
+  "description": "Multi-tenant Security Agency ERP foundation, RBAC security matrix, core data model structures, and edge intelligence operations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

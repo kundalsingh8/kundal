@@ -1,0 +1,41 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isSuperAdmin() {
+      return isAuthenticated() && request.auth.token.role == 'super_admin';
+    }
+
+    // Direct files must match user identity bounds
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // Secures avatars relative to company and user paths
+    match /companies/{companyId}/users/{userId}/avatars/{allPaths=**} {
+      allow read: if isAuthenticated() && (isSuperAdmin() || request.auth.token.companyId == companyId);
+      allow write: if isOwner(userId) && request.resource.size < 5 * 1024 * 1024 && request.resource.contentType.matches('image/.*');
+    }
+
+    // Secures incident documentation evidence bounded by site scopes
+    match /companies/{companyId}/sites/{siteId}/incidents/{allPaths=**} {
+      allow read: if isAuthenticated() && (isSuperAdmin() || request.auth.token.companyId == companyId);
+      allow write: if isAuthenticated() && 
+                    request.auth.token.companyId == companyId && 
+                    (request.auth.token.siteId == siteId || request.auth.token.siteId == "") &&
+                    request.resource.size < 10 * 1024 * 1024 &&
+                    (request.resource.contentType.matches('image/.*') || request.resource.contentType.matches('video/.*'));
+    }
+
+    // Asset schemas or barcodes
+    match /companies/{companyId}/sites/{siteId}/assets/{allPaths=**} {
+      allow read: if isAuthenticated() && (isSuperAdmin() || request.auth.token.companyId == companyId);
+      allow write: if isAuthenticated() && request.auth.token.role in ['site_admin', 'company_admin', 'group_admin', 'super_admin'];
+    }
+  }
+}
